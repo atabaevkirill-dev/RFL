@@ -897,11 +897,13 @@ class MainWindow(QMainWindow):
     def _self_check(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
-        self._proto_box.append("[TX] SELF_CHECK: " + CMD_SELF_CHECK.hex(" ").upper())
+        frame = CMD_SELF_CHECK
+        self._proto_box.append("[TX] SELF_CHECK: " + frame.hex(" ").upper())
+        self._log("🔍 Self-check initiated...")
         threading.Thread(target=self._do_self_check, daemon=True).start()
 
     def _do_self_check(self):
-        self._worker.send(CMD_SELF_CHECK)
+        self._worker.send_and_recv(CMD_SELF_CHECK)
 
     # ── Data reception ────────────────────────────────────────────────────────
     def _on_distance(self, dist: float):
@@ -933,33 +935,64 @@ class MainWindow(QMainWindow):
             parsed = parse_response_frame(rx)
             if parsed:
                 cmd = parsed['cmd']
+                log_msg = None
                 if cmd == 0x01:  # Self-check response
                     status_str = f"FPGA:{parsed['status1']:08b}, Echo:{parsed['status2']}"
                     self._proto_box.append(f"[{ts}] [RX] SELF_CHECK: {status_str}")
+                    log_msg = f"✓ SELF_CHECK: {status_str}"
                 elif cmd in (0x02, 0x04):  # Range response
                     dist = parsed.get('distance', 'N/A')
                     status = parsed.get('status', 'N/A')
                     self._proto_box.append(f"[{ts}] [RX] RANGE: {dist}m (status: 0x{status:02X})")
                 elif cmd == 0x06:  # Anomaly
                     self._proto_box.append(f"[{ts}] [RX] ANOMALY: status1=0x{parsed['status1']:02X}")
+                    log_msg = f"⚠ ANOMALY: status=0x{parsed['status1']:02X}"
+                elif cmd == 0xA1:  # Set frequency response
+                    self._proto_box.append(f"[{ts}] [RX] FREQ_SET: OK")
+                    log_msg = "✓ Frequency set successfully"
                 elif cmd in (0xA2, 0xA4):  # Gate responses
                     dist = parsed.get('gate_distance', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] GATE_SET: {dist}m")
+                    gate_type = "MIN" if cmd == 0xA2 else "MAX"
+                    self._proto_box.append(f"[{ts}] [RX] GATE_{gate_type}_SET: {dist}m")
+                    log_msg = f"✓ {gate_type} gate set to {dist}m"
                 elif cmd in (0xA3, 0xA5):  # Query gate responses
                     dist = parsed.get('gate_distance', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] GATE_QUERY: {dist}m")
-                elif cmd in (0xA6, 0xA7, 0xA8):  # Version responses
-                    self._proto_box.append(f"[{ts}] [RX] VERSION_INFO: cmd=0x{cmd:02X}")
+                    gate_type = "MIN" if cmd == 0xA3 else "MAX"
+                    self._proto_box.append(f"[{ts}] [RX] GATE_{gate_type}_QUERY: {dist}m")
+                    log_msg = f"✓ {gate_type} gate: {dist}m"
+                elif cmd == 0xA6:  # FPGA version
+                    ver = parsed.get('version', 'N/A')
+                    self._proto_box.append(f"[{ts}] [RX] FPGA_VERSION: v{ver}")
+                    log_msg = f"✓ FPGA version: v{ver}"
+                elif cmd == 0xA7:  # MCU version
+                    ver = parsed.get('version', 'N/A')
+                    self._proto_box.append(f"[{ts}] [RX] MCU_VERSION: v{ver}")
+                    log_msg = f"✓ MCU version: v{ver}"
+                elif cmd == 0xA8:  # HW version
+                    mbvs = parsed.get('mbvs', 'N/A')
+                    ctvs = parsed.get('ctvs', 'N/A')
+                    apdvs = parsed.get('apdvs', 'N/A')
+                    ldvs = parsed.get('ldvs', 'N/A')
+                    self._proto_box.append(f"[{ts}] [RX] HW_VERSION: MB={mbvs}, CT={ctvs}, APD={apdvs}, LD={ldvs}")
+                    log_msg = f"✓ HW: MB={mbvs}, CT={ctvs}, APD={apdvs}, LD={ldvs}"
                 elif cmd == 0xA9:  # SN response
                     sn = parsed.get('sn_number', 'N/A')
                     self._proto_box.append(f"[{ts}] [RX] SN: {sn}")
+                    log_msg = f"✓ Serial Number: {sn}"
                 elif cmd in (0x90, 0x91):  # Light count responses
                     count = parsed.get('light_count', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] LIGHT_COUNT: {count}")
+                    count_type = "TOTAL" if cmd == 0x90 else "POWER_ON"
+                    self._proto_box.append(f"[{ts}] [RX] LIGHT_COUNT_{count_type}: {count}")
+                    log_msg = f"✓ {count_type} light count: {count}"
                 else:
                     self._proto_box.append(f"[{ts}] [RX] UNPARSED: {rx.hex(' ').upper()}")
+                
+                # Log to main log box if we have a message
+                if log_msg:
+                    self._log(log_msg)
             else:
                 self._proto_box.append(f"[{ts}] [RX] INVALID_FRAME: {rx.hex(' ').upper()}")
+                self._log(f"⚠ Invalid frame received: {rx.hex(' ').upper()}")
             
             sb = self._proto_box.verticalScrollBar()
             sb.setValue(sb.maximum())
@@ -988,53 +1021,63 @@ class MainWindow(QMainWindow):
     def _apply_gate(self):
         mn, mx = self._min_gate.value(), self._max_gate.value()
         if mn >= mx: self._log("⚠  MIN must be < MAX"); return
-        if self._connected:
-            self._worker.send(cmd_set_min_gate(mn))
-            self._worker.send(cmd_set_max_gate(mx))
+        if not self._connected:
+            self._log("⚠  Not connected"); return
+        frame_min = cmd_set_min_gate(mn)
+        frame_max = cmd_set_max_gate(mx)
+        self._proto_box.append("[TX] SET_MIN_GATE: " + frame_min.hex(" ").upper())
+        self._proto_box.append("[TX] SET_MAX_GATE: " + frame_max.hex(" ").upper())
         self._log(f"Gate → {mn} m … {mx} m")
+        threading.Thread(target=lambda: (self._worker.send_and_recv(frame_min), self._worker.send_and_recv(frame_max)), daemon=True).start()
 
     # ── Device info queries ────────────────────────────────────────────────────
     def _query_min_gate(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_min_gate()
-        self._worker.send(frame)
+        self._worker.send_and_recv(frame)
         self._proto_box.append("[TX] QUERY_MIN_GATE: " + frame.hex(" ").upper())
+        self._log("Querying MIN gate...")
 
     def _query_max_gate(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_max_gate()
-        self._worker.send(frame)
+        self._worker.send_and_recv(frame)
         self._proto_box.append("[TX] QUERY_MAX_GATE: " + frame.hex(" ").upper())
+        self._log("Querying MAX gate...")
 
     def _query_fpga_version(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_fpga_version()
-        self._worker.send(frame)
+        self._worker.send_and_recv(frame)
         self._proto_box.append("[TX] QUERY_FPGA_VERSION: " + frame.hex(" ").upper())
+        self._log("Querying FPGA version...")
 
     def _query_mcu_version(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_mcu_version()
-        self._worker.send(frame)
+        self._worker.send_and_recv(frame)
         self._proto_box.append("[TX] QUERY_MCU_VERSION: " + frame.hex(" ").upper())
+        self._log("Querying MCU version...")
 
     def _query_hw_version(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_hw_version()
-        self._worker.send(frame)
+        self._worker.send_and_recv(frame)
         self._proto_box.append("[TX] QUERY_HW_VERSION: " + frame.hex(" ").upper())
+        self._log("Querying HW version...")
 
     def _query_sn(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_sn()
-        self._worker.send(frame)
+        self._worker.send_and_recv(frame)
         self._proto_box.append("[TX] QUERY_SN: " + frame.hex(" ").upper())
+        self._log("Querying Serial Number...")
 
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _stat_box(self, label: str, value: str) -> QFrame:
