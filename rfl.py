@@ -8,7 +8,6 @@ import sys
 import math
 import struct
 import threading
-import socket
 from datetime import datetime
 from collections import deque
 
@@ -18,24 +17,13 @@ import serial.tools.list_ports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QPushButton, QLabel, QComboBox, QSpinBox,
-    QTextEdit, QGroupBox, QFrame, QSlider, QTabWidget, QLineEdit, QStackedWidget, QRadioButton, QButtonGroup
+    QTextEdit, QGroupBox, QFrame, QSlider, QTabWidget
 )
-from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal, QObject, QUrl
+from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal, QObject
 from PyQt6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont, QPixmap, QImage,
+    QPainter, QPen, QBrush, QColor, QFont,
     QLinearGradient, QConicalGradient, QPainterPath
 )
-
-# Попытка импортировать QtMultimedia для камеры
-try:
-    from PyQt6.QtMultimedia import QCamera, QMediaDevice, QCaptureSession
-    from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
-    HAS_MULTIMEDIA = True
-except ImportError:
-    HAS_MULTIMEDIA = False
-
-# Для HTTP-потока камеры
-import urllib.request
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 BG_DARK      = QColor("#0A0E17")
@@ -52,8 +40,8 @@ GRID_LINE    = QColor("#1A2840")
 FRAME_HEAD = bytes([0xEE, 0x16])
 
 def build_frame(cmd: int, params: list[int] = []) -> bytes:
-    body = [0x03, cmd] + params
-    length = len(body)  # Теперь длина включает Device code, Command code и Command parameters
+    body = [0x03, cmd] + params  # Device code (0x03) + Command code + Parameters
+    length = len(body)  # Length excludes header and checksum
     chk = sum(body) & 0xFF
     return bytes([0xEE, 0x16, length] + body + [chk])
 
@@ -126,7 +114,7 @@ def parse_response_frame(data: bytes) -> dict | None:
     # Извлекаем компоненты
     device_code = data[3]  # Должно быть 0x03
     cmd = data[4]
-    params = data[5:3+length]  # Параметры после команды (длина = length - 2)
+    params = data[5:5+length-2]  # Параметры после команды (длина = length - 2)
     checksum_idx = 3 + length  # Индекс чек-суммы
     received_checksum = data[checksum_idx]
 
@@ -261,8 +249,8 @@ def parse_range_response(data: bytes) -> float | None:
         return parsed['distance']
     return None
 
-# ── Serial/TCP worker (runs in thread) ───────────────────────────────────────
-class CommWorker(QObject):
+# ── Serial worker (runs in thread) ───────────────────────────────────────────
+class SerialWorker(QObject):
     distance_received = pyqtSignal(float)
     raw_frame         = pyqtSignal(bytes, bytes)   # tx, rx
     error             = pyqtSignal(str)
@@ -271,68 +259,34 @@ class CommWorker(QObject):
     def __init__(self):
         super().__init__()
         self._ser: serial.Serial | None = None
-        self._sock: socket.socket | None = None
-        self._is_tcp = False
         self._lock = threading.Lock()
         self._buf = bytearray()
 
-    def connect_serial(self, port: str, baud: int) -> bool:
+    def connect(self, port: str, baud: int) -> bool:
         try:
             self._ser = serial.Serial(port, baud, timeout=1.0)
-            self._is_tcp = False
             self.connected.emit(True)
             return True
         except Exception as e:
             self.error.emit(f"Cannot open {port}: {e}")
             return False
 
-    def connect_tcp(self, host: str, port: int) -> bool:
-        try:
-            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self._sock.settimeout(1.0)
-            self._sock.connect((host, port))
-            self._is_tcp = True
-            self.connected.emit(True)
-            return True
-        except Exception as e:
-            self.error.emit(f"Cannot connect to {host}:{port}: {e}")
-            return False
-
     def disconnect(self):
         if self._ser and self._ser.is_open:
             self._ser.close()
-        if self._sock:
-            try:
-                self._sock.close()
-            except:
-                pass
         self._ser = None
-        self._sock = None
         self.connected.emit(False)
 
     def send(self, frame: bytes):
-        if self._is_tcp:
-            if not self._sock:
-                self.error.emit("Not connected (TCP)")
-                return
-            with self._lock:
-                self._sock.sendall(frame)
-        else:
-            if not self._ser or not self._ser.is_open:
-                self.error.emit("Not connected (Serial)")
-                return
-            with self._lock:
-                self._ser.write(frame)
-                self._ser.flush()
+        if not self._ser or not self._ser.is_open:
+            self.error.emit("Not connected")
+            return
+        with self._lock:
+            self._ser.write(frame)
+            self._ser.flush()
 
     def send_and_recv(self, frame: bytes):
         """Send a command and collect the response frame."""
-        if self._is_tcp:
-            self._send_and_recv_tcp(frame)
-        else:
-            self._send_and_recv_serial(frame)
-
-    def _send_and_recv_serial(self, frame: bytes):
         if not self._ser or not self._ser.is_open:
             self.error.emit("Not connected")
             return
@@ -360,197 +314,79 @@ class CommWorker(QObject):
             else:
                 expected_len = 10  # По умолчанию
                 
-            # Ждем ответ от устройства
-            import time
-            time.sleep(0.05)  # Небольшая задержка для стабильности
             raw = self._ser.read(expected_len)
             self.raw_frame.emit(frame, raw)
-            
-            # Парсим ответ и отправляем сигнал о расстоянии если это измерение
-            parsed = parse_response_frame(raw)
-            if parsed:
-                if parsed['cmd'] in (0x02, 0x04) and 'distance' in parsed and not parsed.get('out_of_range', False):
-                    self.distance_received.emit(parsed['distance'])
-                elif parsed['cmd'] == 0x06:  # Anomaly
-                    self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
-
-    def _send_and_recv_tcp(self, frame: bytes):
-        if not self._sock:
-            self.error.emit("Not connected (TCP)")
-            return
-        with self._lock:
-            self._sock.sendall(frame)
-            # Определяем ожидаемую длину ответа
-            cmd = frame[3]
-            
-            if cmd in [0x01, 0x02, 0x04]:
-                expected_len = 10
-            elif cmd in [0x03, 0x05]:
-                expected_len = 6
-            elif cmd in [0xA1]:
-                expected_len = 6
-            elif cmd in [0xA2, 0xA3, 0xA4, 0xA5]:
-                expected_len = 8
-            elif cmd in [0xA6, 0xA7, 0xA8]:
-                expected_len = 10
-            elif cmd == 0xA9:
-                expected_len = 9
-            elif cmd in [0x90, 0x91]:
-                expected_len = 9
-            else:
-                expected_len = 10
-            
-            import time
-            time.sleep(0.05)
-            
-            # Читаем заголовок и длину
-            header = bytearray()
-            while len(header) < 3:
-                try:
-                    chunk = self._sock.recv(3 - len(header))
-                    if not chunk:
-                        self.error.emit("TCP connection closed")
-                        return
-                    header.extend(chunk)
-                except socket.timeout:
-                    self.error.emit("TCP read timeout")
-                    return
-            
-            if header[0] != 0xEE or header[1] != 0x16:
-                self.error.emit(f"Invalid TCP header: {header[:2].hex()}")
-                return
-            
-            length = header[2]
-            remaining = length + 1  # тело + чексумма
-            
-            raw = bytearray(header)
-            while len(raw) < 3 + length + 1:
-                try:
-                    chunk = self._sock.recv(3 + length + 1 - len(raw))
-                    if not chunk:
-                        break
-                    raw.extend(chunk)
-                except socket.timeout:
-                    break
-            
-            self.raw_frame.emit(frame, bytes(raw))
-            
-            parsed = parse_response_frame(bytes(raw))
-            if parsed:
-                if parsed['cmd'] in (0x02, 0x04) and 'distance' in parsed and not parsed.get('out_of_range', False):
-                    self.distance_received.emit(parsed['distance'])
-                elif parsed['cmd'] == 0x06:
-                    self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
+            dist = parse_range_response(raw)
+            if dist is not None:
+                self.distance_received.emit(dist)
 
     def read_pending(self):
         """Called by timer — drain incoming bytes and parse frames."""
-        if self._is_tcp:
-            self._read_pending_tcp()
-        else:
-            self._read_pending_serial()
-
-    def _read_pending_serial(self):
         if not self._ser or not self._ser.is_open:
             return
         try:
             n = self._ser.in_waiting
             if n:
-                self._buf += self._ser.read(n)
+                incoming_data = self._ser.read(n)
+                self._buf.extend(incoming_data)
                 
-                # Обработка буфера по полным фреймам
-                while len(self._buf) >= 6:  # Минимальная длина фрейма
-                    # Ищем начало фрейма
+                # Process the buffer looking for complete frames
+                while len(self._buf) >= 6:  # Minimum frame length
+                    # Look for frame start
                     idx = self._buf.find(b'\xEE\x16')
                     if idx < 0:
-                        # Если начало фрейма не найдено, очищаем буфер до следующего возможного начала
-                        if len(self._buf) > 100:  # Если буфер большой, очищаем его полностью
+                        # If no frame start is found, clear the buffer beyond reasonable size to avoid garbage accumulation
+                        if len(self._buf) > 100:  # If buffer is large, clear it to avoid accumulation of garbage
                             self._buf.clear()
                         break
                     if idx > 0:
-                        # Удаляем байты до начала фрейма
+                        # Remove bytes before frame start
                         self._buf = self._buf[idx:]
                     
-                    # Проверяем, достаточно ли байтов для чтения длины
+                    # Check if we have enough bytes to read the length
                     if len(self._buf) < 3:
                         break
                     
-                    # Читаем длину пакета
+                    # Read packet length
                     length = self._buf[2]
-                    expected_length = 3 + length + 1  # заголовок(2) + длина(1) + тело(length) + чек-сумма(1)
+                    expected_length = 3 + length + 1  # header(2) + length(1) + body(length) + checksum(1)
                     
-                    # Проверяем, есть ли полный фрейм в буфере
+                    # Check if we have a complete frame in the buffer
                     if len(self._buf) < expected_length:
                         break
                     
-                    # Извлекаем полный фрейм
+                    # Extract the complete frame
                     frame = bytes(self._buf[:expected_length])
                     self._buf = self._buf[expected_length:]
                     
-                    # Обработка ответа
-                    parsed = parse_response_frame(frame)
-                    if parsed:
-                        # Обработка ответов на измерения
-                        if parsed['cmd'] in (0x02, 0x04) and 'distance' in parsed and not parsed.get('out_of_range', False):
-                            self.distance_received.emit(parsed['distance'])
-                        
-                        # Обработка аномальных ситуаций
-                        elif parsed['cmd'] == 0x06:
-                            self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
-                        
-                        # Отправка фрейма в GUI для отображения
-                        self.raw_frame.emit(b'', frame)
+                    # Validate frame before processing
+                    if len(frame) >= 6 and frame[0] == 0xEE and frame[1] == 0x16:
+                        # Process response
+                        parsed = parse_response_frame(frame)
+                        if parsed:
+                            # Handle ranging responses
+                            if parsed['cmd'] in (0x02, 0x04) and 'distance' in parsed and not parsed.get('out_of_range', False):
+                                self.distance_received.emit(parsed['distance'])
+                            
+                            # Handle anomalies
+                            elif parsed['cmd'] == 0x06:
+                                self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
+                            
+                            # Handle version/SN queries responses
+                            elif parsed['cmd'] in (0xA6, 0xA7, 0xA8, 0xA9):  # Version/SN responses
+                                # Just emit the frame for display - no special handling needed
+                                self.raw_frame.emit(b'', frame)
+                            
+                            # Emit frame for display in all cases
+                            else:
+                                self.raw_frame.emit(b'', frame)
+                        else:
+                            # If parsing failed, emit raw frame for diagnostic purposes
+                            self.error.emit(f"Invalid frame received: {frame.hex().upper()}")
+                            self.raw_frame.emit(b'', frame)
                     else:
-                        # Если не удалось распарсить, отправляем необработанный фрейм для диагностики
-                        self.raw_frame.emit(b'', frame)
-        except Exception as e:
-            self.error.emit(str(e))
-
-    def _read_pending_tcp(self):
-        if not self._sock:
-            return
-        try:
-            self._sock.setblocking(False)
-            try:
-                data = self._sock.recv(4096)
-                if not data:
-                    self.error.emit("TCP connection closed")
-                    self.disconnect()
-                    return
-                self._buf += data
-                
-                # Обработка буфера по полным фреймам
-                while len(self._buf) >= 6:
-                    idx = self._buf.find(b'\xEE\x16')
-                    if idx < 0:
-                        if len(self._buf) > 100:
-                            self._buf.clear()
-                        break
-                    if idx > 0:
-                        self._buf = self._buf[idx:]
-                    
-                    if len(self._buf) < 3:
-                        break
-                    
-                    length = self._buf[2]
-                    expected_length = 3 + length + 1
-                    
-                    if len(self._buf) < expected_length:
-                        break
-                    
-                    frame = bytes(self._buf[:expected_length])
-                    self._buf = self._buf[expected_length:]
-                    
-                    parsed = parse_response_frame(frame)
-                    if parsed:
-                        if parsed['cmd'] in (0x02, 0x04) and 'distance' in parsed and not parsed.get('out_of_range', False):
-                            self.distance_received.emit(parsed['distance'])
-                        elif parsed['cmd'] == 0x06:
-                            self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
-                        self.raw_frame.emit(b'', frame)
-                    else:
-                        self.raw_frame.emit(b'', frame)
-            except BlockingIOError:
-                pass  # Нет данных
+                        # Skip invalid frame start, look for next
+                        continue
         except Exception as e:
             self.error.emit(str(e))
 
@@ -569,17 +405,21 @@ class CameraWidget(QWidget):
         self._target_distance = 0.0
         self._max_dist = 4200.0
         self._frame_count = 0
+        self._is_streaming = False
+        
+        # Устанавливаем фиксированный размер
+        self.setFixedSize(300, 225)
         
         # Таймер для обновления кадра
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._fetch_frame)
-        self._update_timer.start(1000)  # Обновление каждые 1000мс (медленнее для стабильности)
+        # Не запускаем таймер сразу - только когда нужно стримить
         
         # Метка для отображения расстояния
         self._distance_label = QLabel("0.0 m", self)
         self._distance_label.setStyleSheet(
-            "color: #00FF88; font-size: 24px; font-weight: bold; "
-            "background: rgba(10, 14, 23, 0.7); padding: 8px 16px; "
+            "color: #00FF88; font-size: 14px; font-weight: bold; "
+            "background: rgba(10, 14, 23, 0.7); padding: 4px 8px; "
             "border-radius: 4px; border: 1px solid #00FF88;"
         )
         self._distance_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -588,9 +428,10 @@ class CameraWidget(QWidget):
         # Метка цели в центре
         self._target_label = QLabel("⊕", self)
         self._target_label.setStyleSheet(
-            "color: #FF3B5C; font-size: 32px; font-weight: bold;"
+            "color: #FF3B5C; font-size: 24px; font-weight: bold;"
         )
         self._target_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._target_label.setGeometry(self.width()//2 - 12, self.height()//2 - 12, 24, 24)
         
     def set_camera_credentials(self, ip: str, user: str, password: str):
         """Установить учетные данные камеры"""
@@ -598,14 +439,29 @@ class CameraWidget(QWidget):
         self._camera_user = user
         self._camera_pass = password
         
+    def start_streaming(self):
+        """Начать стриминг с IP-камеры"""
+        if not self._is_streaming:
+            self._is_streaming = True
+            self._update_timer.start(100)  # Обновление каждые 100мс для более плавного видео
+            
+    def stop_streaming(self):
+        """Остановить стриминг с IP-камеры"""
+        if self._is_streaming:
+            self._is_streaming = False
+            self._update_timer.stop()
+    
     def _fetch_frame(self):
         """Получить кадр с IP-камеры через HTTP MJPEG stream"""
         try:
             # Пробуем разные форматы URL для разных производителей камер
             urls_to_try = [
                 f"http://{self._camera_ip}/Streaming/Channels/101",  # Hikvision
-                f"http://{self._camera_ip}/video",  # Общий
-                f"http://{self._camera_ip}/mjpg/video.cgi",  # Некоторые камеры
+                f"http://{self._camera_ip}/video.cgi",  # Common CGI
+                f"http://{self._camera_ip}/mjpeg",  # MJPEG stream
+                f"http://{self._camera_ip}/mjpg/video.mjpg",  # Some cameras
+                f"http://{self._camera_ip}/cgi-bin/mjpg/video.cgi",  # Generic
+                f"http://{self._camera_ip}/videostream.cgi",  # Another common format
             ]
             
             # Добавляем аутентификацию через заголовок вместо URL
@@ -619,16 +475,17 @@ class CameraWidget(QWidget):
                 try:
                     req = urllib.request.Request(url)
                     req.add_header('Authorization', f'Basic {auth_bytes}')
+                    req.add_header('User-Agent', 'Mozilla/5.0')
                     
-                    with urllib.request.urlopen(req, timeout=3) as response:
+                    with urllib.request.urlopen(req, timeout=2) as response:
                         # Читаем данные - пытаемся найти JPEG кадр
-                        chunk_size = 1024
+                        chunk_size = 8192  # Увеличиваем размер чанка для лучшей производительности
                         data = bytearray()
                         jpeg_start = b'\xff\xd8'
                         jpeg_end = b'\xff\xd9'
                         
                         # Читаем часть потока
-                        for _ in range(50):  # Максимум 50 итераций
+                        for _ in range(20):  # Максимум 20 итераций
                             chunk = response.read(chunk_size)
                             if not chunk:
                                 break
@@ -638,7 +495,7 @@ class CameraWidget(QWidget):
                             start_idx = data.find(jpeg_start)
                             end_idx = data.find(jpeg_end, start_idx)
                             
-                            if start_idx != -1 and end_idx != -1:
+                            if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
                                 jpeg_data = bytes(data[start_idx:end_idx+2])
                                 
                                 image = QImage()
@@ -648,6 +505,19 @@ class CameraWidget(QWidget):
                                         Qt.AspectRatioMode.KeepAspectRatio,
                                         Qt.TransformationMode.SmoothTransformation
                                     )
+                                    
+                                    # Позиционируем элементы интерфейса относительно размера виджета
+                                    cx = self.width() // 2
+                                    cy = self.height() // 2
+                                    
+                                    # Обновляем позиции элементов
+                                    self._target_label.setGeometry(cx - 12, cy - 12, 24, 24)
+                                    
+                                    if self._target_distance > 0:
+                                        label_x = cx - 50
+                                        label_y = cy + 30
+                                        self._distance_label.setGeometry(label_x, label_y, 100, 25)
+                                    
                                     self.frame_updated.emit(self._current_pixmap)
                                     self.update()
                                     self._frame_count += 1
@@ -657,9 +527,9 @@ class CameraWidget(QWidget):
                         if pixmap_loaded:
                             break
                             
-                except Exception:
+                except Exception as e:
                     continue  # Пробуем следующий URL
-            
+                
             # Если ни один URL не сработал - показываем заглушку
             if not pixmap_loaded and self._frame_count == 0:
                 self._current_pixmap = QPixmap()
@@ -675,8 +545,23 @@ class CameraWidget(QWidget):
         """Установить расстояние до цели"""
         self._target_distance = distance
         self._distance_label.setText(f"{distance:.1f} m")
-        self._distance_label.show()
+        if distance > 0:
+            self._distance_label.show()
+        else:
+            self._distance_label.hide()
         self.update()
+    
+    def resizeEvent(self, event):
+        """Обновить позиции элементов при изменении размера"""
+        super().resizeEvent(event)
+        # Обновляем позиции элементов интерфейса
+        cx = self.width() // 2
+        cy = self.height() // 2
+        self._target_label.setGeometry(cx - 12, cy - 12, 24, 24)
+        if self._target_distance > 0:
+            label_x = cx - 50
+            label_y = cy + 30
+            self._distance_label.setGeometry(label_x, label_y, 100, 25)
     
     def paintEvent(self, event):
         p = QPainter(self)
@@ -694,7 +579,7 @@ class CameraWidget(QWidget):
         else:
             # Показываем заглушку если нет изображения
             p.setPen(QPen(TEXT_DIM, 2))
-            p.setFont(QFont("Courier New", 14))
+            p.setFont(QFont("Courier New", 10))
             p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, 
                       f"IP CAMERA\n{self._camera_ip}\nNo Signal")
         
@@ -704,28 +589,98 @@ class CameraWidget(QWidget):
         # Внешний круг
         p.setPen(QPen(ACCENT_RED, 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(QPointF(cx, cy), 25, 25)
+        p.drawEllipse(QPointF(cx, cy), 20, 20)
         
         # Внутренний круг
         p.setPen(QPen(ACCENT_RED, 1))
-        p.drawEllipse(QPointF(cx, cy), 15, 15)
+        p.drawEllipse(QPointF(cx, cy), 12, 12)
         
         # Перекрестие
-        p.drawLine(cx - 30, cy, cx + 30, cy)
-        p.drawLine(cx, cy - 30, cx, cy + 30)
+        p.drawLine(cx - 25, cy, cx + 25, cy)
+        p.drawLine(cx, cy - 25, cx, cy + 25)
         
         # Точка в центре
         p.setBrush(QBrush(ACCENT_RED))
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(cx, cy), 3, 3)
+        p.drawEllipse(QPointF(cx, cy), 2, 2)
         
-        # Метка расстояния внизу
+        # Метка расстояния
         if self._target_distance > 0:
-            label_x = cx - 60
-            label_y = cy + 50
-            self._distance_label.setGeometry(label_x, label_y, 120, 40)
+            label_x = cx - 50
+            label_y = cy + 30
+            self._distance_label.setGeometry(label_x, label_y, 100, 25)
             self._distance_label.raise_()
         
+        p.end()
+
+
+class RadarWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumSize(290, 290)
+        self._sweep = 0.0
+        self._blips: list[tuple[float, float, float]] = []
+        self._max_dist = 4200.0
+        t = QTimer(self); t.timeout.connect(self._tick); t.start(30)
+
+    def add_blip(self, dist: float):
+        norm = min(dist / self._max_dist, 1.0)
+        self._blips.append((math.radians(self._sweep), norm, 1.0))
+        self._blips = self._blips[-80:]
+
+    def _tick(self):
+        self._sweep = (self._sweep + 1.5) % 360
+        self._blips = [(a, d, age - 0.015) for a, d, age in self._blips if age > 0]
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w, h = self.width(), self.height()
+        cx, cy = w / 2, h / 2
+        r = min(cx, cy) - 6
+        p.fillRect(self.rect(), BG_DARK)
+
+        # rings + cross
+        p.setPen(QPen(GRID_LINE, 1))
+        for i in range(1, 5):
+            rr = r * i / 4
+            p.drawEllipse(QPointF(cx, cy), rr, rr)
+        p.drawLine(int(cx), int(cy - r), int(cx), int(cy + r))
+        p.drawLine(int(cx - r), int(cy), int(cx + r), int(cy))
+
+        # labels
+        p.setFont(QFont("Courier New", 7))
+        for i, lbl in enumerate(["1050", "2100", "3150", "4200"], 1):
+            p.setPen(QPen(TEXT_DIM))
+            p.drawText(int(cx + r * i / 4 + 2), int(cy - 2), lbl + "m")
+
+        # sweep fan
+        sg = QConicalGradient(cx, cy, -self._sweep)
+        c1 = QColor(ACCENT_CYAN); c1.setAlpha(110)
+        c2 = QColor(ACCENT_CYAN); c2.setAlpha(0)
+        sg.setColorAt(0.0, c1); sg.setColorAt(0.18, c2); sg.setColorAt(1.0, c2)
+        p.setBrush(QBrush(sg)); p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx, cy), r, r)
+
+        # sweep line
+        sx = cx + r * math.cos(math.radians(-self._sweep))
+        sy = cy + r * math.sin(math.radians(-self._sweep))
+        p.setPen(QPen(ACCENT_CYAN, 1.5))
+        p.drawLine(QPointF(cx, cy), QPointF(sx, sy))
+
+        # blips
+        for angle, norm, age in self._blips:
+            bx = cx + r * norm * math.cos(angle)
+            by = cy - r * norm * math.sin(angle)
+            col = QColor(ACCENT_GREEN); col.setAlpha(int(age * 230))
+            p.setBrush(QBrush(col)); p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QPointF(bx, by), 5, 5)
+
+        # rim
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(ACCENT_CYAN, 1.5))
+        p.drawEllipse(QPointF(cx, cy), r, r)
         p.end()
 
 
@@ -913,7 +868,6 @@ class MainWindow(QMainWindow):
         self._continuous = False
         self._history: list[float] = []
         self._shot_count = 0
-        self._connection_mode = "serial"  # "serial" или "tcp"
 
         # Timer to drain serial RX in continuous mode
         self._rx_timer = QTimer(self)
@@ -923,6 +877,9 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._refresh_ports()
         self._log("Application started — select port and click CONNECT")
+        
+        # Initialize camera widget with default credentials
+        self._camera_widget.set_camera_credentials("192.168.1.168", "admin", "123456")
 
     # ── Build UI ──────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -947,25 +904,6 @@ class MainWindow(QMainWindow):
         # Connection
         cb = QGroupBox("CONNECTION"); cl = QVBoxLayout(cb); cl.setSpacing(6)
 
-        # Mode selection (Serial / TCP)
-        mode_row = QHBoxLayout()
-        self._serial_radio = QRadioButton("SERIAL")
-        self._tcp_radio = QRadioButton("TCP/IP")
-        self._serial_radio.setChecked(True)
-        self._mode_group = QButtonGroup(self)
-        self._mode_group.addButton(self._serial_radio)
-        self._mode_group.addButton(self._tcp_radio)
-        self._serial_radio.toggled.connect(self._on_mode_changed)
-        mode_row.addWidget(self._serial_radio)
-        mode_row.addWidget(self._tcp_radio)
-        cl.addLayout(mode_row)
-
-        # Serial settings
-        self._serial_widget = QWidget()
-        serial_layout = QVBoxLayout(self._serial_widget)
-        serial_layout.setContentsMargins(0, 4, 0, 0)
-        serial_layout.setSpacing(6)
-        
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("PORT"))
         self._port_cb = QComboBox(); self._port_cb.setMinimumWidth(130)
@@ -974,40 +912,14 @@ class MainWindow(QMainWindow):
         refresh_btn.setFixedWidth(30); refresh_btn.setToolTip("Refresh ports")
         refresh_btn.clicked.connect(self._refresh_ports)
         port_row.addWidget(refresh_btn)
-        serial_layout.addLayout(port_row)
+        cl.addLayout(port_row)
 
         baud_row = QHBoxLayout()
         baud_row.addWidget(QLabel("BAUD"))
         self._baud_cb = QComboBox()
         self._baud_cb.addItems(["115200", "57600", "9600"])
         baud_row.addWidget(self._baud_cb, 1)
-        serial_layout.addLayout(baud_row)
-        
-        cl.addWidget(self._serial_widget)
-
-        # TCP settings
-        self._tcp_widget = QWidget()
-        tcp_layout = QVBoxLayout(self._tcp_widget)
-        tcp_layout.setContentsMargins(0, 4, 0, 0)
-        tcp_layout.setSpacing(6)
-        self._tcp_widget.setVisible(False)
-        
-        host_row = QHBoxLayout()
-        host_row.addWidget(QLabel("HOST"))
-        self._host_edit = QLineEdit("192.168.1.100")
-        self._host_edit.setPlaceholderText("IP address")
-        host_row.addWidget(self._host_edit, 1)
-        tcp_layout.addLayout(host_row)
-        
-        tcpport_row = QHBoxLayout()
-        tcpport_row.addWidget(QLabel("PORT"))
-        self._tcp_port_spin = QSpinBox()
-        self._tcp_port_spin.setRange(1, 65535)
-        self._tcp_port_spin.setValue(8888)
-        tcpport_row.addWidget(self._tcp_port_spin, 1)
-        tcp_layout.addLayout(tcpport_row)
-        
-        cl.addWidget(self._tcp_widget)
+        cl.addLayout(baud_row)
 
         self._conn_btn = QPushButton("⚡  CONNECT")
         self._conn_btn.setObjectName("green")
@@ -1134,38 +1046,18 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout(); right.setSpacing(8)
         root.addLayout(right, 0)
 
-        rl = QLabel("IP CAMERA VIEW")
+        # Camera section
+        cam_title = QLabel("IP CAMERA")
+        cam_title.setStyleSheet("color:#4A6080;font-size:9px;letter-spacing:3px;")
+        right.addWidget(cam_title)
+        self._camera_widget = CameraWidget()
+        right.addWidget(self._camera_widget)
+
+        rl = QLabel("RADAR VIEW")
         rl.setStyleSheet("color:#4A6080;font-size:9px;letter-spacing:3px;")
         right.addWidget(rl)
-        
-        # Camera settings group
-        cam_settings = QGroupBox("CAMERA SETTINGS")
-        cam_layout = QGridLayout(cam_settings)
-        
-        cam_layout.addWidget(QLabel("IP Address"), 0, 0)
-        self._cam_ip_edit = QLineEdit("192.168.1.168")
-        cam_layout.addWidget(self._cam_ip_edit, 0, 1)
-        
-        cam_layout.addWidget(QLabel("Username"), 1, 0)
-        self._cam_user_edit = QLineEdit("admin")
-        cam_layout.addWidget(self._cam_user_edit, 1, 1)
-        
-        cam_layout.addWidget(QLabel("Password"), 2, 0)
-        self._cam_pass_edit = QLineEdit("123456")
-        self._cam_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        cam_layout.addWidget(self._cam_pass_edit, 2, 1)
-        
-        apply_cam_btn = QPushButton("APPLY CAMERA")
-        apply_cam_btn.clicked.connect(self._apply_camera_settings)
-        cam_layout.addWidget(apply_cam_btn, 3, 0, 1, 2)
-        
-        right.addWidget(cam_settings)
-        
-        # Camera widget with crosshair
-        self._camera = CameraWidget()
-        self._camera.setFixedWidth(295)
-        self._camera.setFixedHeight(295)
-        right.addWidget(self._camera)
+        self._radar = RadarWidget(); self._radar.setFixedWidth(295)
+        right.addWidget(self._radar)
 
         info_box = QGroupBox("DEVICE SPECS"); il = QGridLayout(info_box)
         specs = [("WAVELENGTH","1535 ± 5 nm"),("MAX RANGE","4200 m"),
@@ -1181,24 +1073,8 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("STATUS: OFFLINE  |  SELECT PORT AND CONNECT")
 
-    # ── Mode change handler ───────────────────────────────────────────────────
-    def _on_mode_changed(self):
-        if self._serial_radio.isChecked():
-            self._connection_mode = "serial"
-            self._serial_widget.setVisible(True)
-            self._tcp_widget.setVisible(False)
-            self._refresh_ports()
-            self._log("Connection mode: SERIAL")
-        else:
-            self._connection_mode = "tcp"
-            self._serial_widget.setVisible(False)
-            self._tcp_widget.setVisible(True)
-            self._log("Connection mode: TCP/IP")
-
     # ── Port refresh ──────────────────────────────────────────────────────────
     def _refresh_ports(self):
-        if self._connection_mode != "serial":
-            return
         self._port_cb.clear()
         ports = serial.tools.list_ports.comports()
         if not ports:
@@ -1215,17 +1091,11 @@ class MainWindow(QMainWindow):
     # ── Connection ────────────────────────────────────────────────────────────
     def _toggle_connect(self):
         if not self._connected:
-            if self._connection_mode == "serial":
-                idx = self._port_cb.currentIndex()
-                port = self._port_cb.itemData(idx) or self._port_cb.currentText().split()[0]
-                baud = int(self._baud_cb.currentText())
-                self._log(f"Connecting to {port} @ {baud} bps …")
-                self._worker.connect_serial(port, baud)
-            else:
-                host = self._host_edit.text().strip()
-                port = self._tcp_port_spin.value()
-                self._log(f"Connecting to {host}:{port} …")
-                self._worker.connect_tcp(host, port)
+            idx = self._port_cb.currentIndex()
+            port = self._port_cb.itemData(idx) or self._port_cb.currentText().split()[0]
+            baud = int(self._baud_cb.currentText())
+            self._log(f"Connecting to {port} @ {baud} bps …")
+            self._worker.connect(port, baud)
         else:
             self._stop_ranging()
             self._worker.disconnect()
@@ -1238,14 +1108,13 @@ class MainWindow(QMainWindow):
             self._conn_btn.setObjectName("red"); self._conn_btn.setStyle(self._conn_btn.style())
             self._single_btn.setEnabled(True)
             self._cont_btn.setEnabled(True)
-            if self._connection_mode == "serial":
-                port = self._port_cb.itemData(self._port_cb.currentIndex()) or ""
-                baud_str = f" | {self._baud_cb.currentText()} bps"
-            else:
-                port = f"{self._host_edit.text()}:{self._tcp_port_spin.value()}"
-                baud_str = ""
+            port = self._port_cb.itemData(self._port_cb.currentIndex()) or ""
             self._log(f"Connected → {port}")
-            self.statusBar().showMessage(f"STATUS: ONLINE  |  {port}{baud_str}")
+            self.statusBar().showMessage(f"STATUS: ONLINE  |  {port}  |  {self._baud_cb.currentText()} bps")
+            
+            # Start camera streaming when connected
+            self._camera_widget.start_streaming()
+            self._log("✓ Camera settings applied: 192.168.1.168")
         else:
             self._conn_btn.setText("⚡  CONNECT")
             self._conn_btn.setObjectName("green"); self._conn_btn.setStyle(self._conn_btn.style())
@@ -1255,19 +1124,18 @@ class MainWindow(QMainWindow):
             self._led_laser.set_on(False); self._led_echo.set_on(False)
             self._log("Disconnected")
             self.statusBar().showMessage("STATUS: OFFLINE")
+            
+            # Stop camera streaming when disconnected
+            self._camera_widget.stop_streaming()
 
     # ── Ranging commands ──────────────────────────────────────────────────────
     def _single_shot(self):
-        if not self._connected:
-            self._log("⚠  Not connected"); return
         frame = cmd_set_mode(self._active_mode)
         self._worker.send(frame)
         self._proto_box.append("[TX] SET_MODE: " + frame.hex(" ").upper())
         frame = CMD_SINGLE
-        self._worker.send(frame)
         self._proto_box.append("[TX] SINGLE:   " + frame.hex(" ").upper())
         self._led_laser.set_on(True)
-        self._log("Single shot initiated")
         # use thread so UI stays responsive
         threading.Thread(target=self._worker.send_and_recv,
                          args=(CMD_SINGLE,), daemon=True).start()
@@ -1315,13 +1183,11 @@ class MainWindow(QMainWindow):
     def _self_check(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
-        frame = CMD_SELF_CHECK
-        self._proto_box.append("[TX] SELF_CHECK: " + frame.hex(" ").upper())
-        self._log("🔍 Self-check initiated...")
+        self._proto_box.append("[TX] SELF_CHECK: " + CMD_SELF_CHECK.hex(" ").upper())
         threading.Thread(target=self._do_self_check, daemon=True).start()
 
     def _do_self_check(self):
-        self._worker.send_and_recv(CMD_SELF_CHECK)
+        self._worker.send(CMD_SELF_CHECK)
 
     # ── Data reception ────────────────────────────────────────────────────────
     def _on_distance(self, dist: float):
@@ -1330,8 +1196,10 @@ class MainWindow(QMainWindow):
         if len(self._history) > 1000: self._history = self._history[-1000:]
         self._big_disp.set_value(dist)
         self._chart.push(dist)
-        # Обновляем камеру вместо радара
-        self._camera.set_target_distance(dist)
+        self._radar.add_blip(dist)
+        
+        # Update camera widget with target distance
+        self._camera_widget.set_target_distance(dist)
         
         # Update LEDs - we have a valid distance so both laser and echo should be active
         self._led_laser.set_on(True)
@@ -1354,103 +1222,33 @@ class MainWindow(QMainWindow):
             parsed = parse_response_frame(rx)
             if parsed:
                 cmd = parsed['cmd']
-                log_msg = None
                 if cmd == 0x01:  # Self-check response
-                    status1 = parsed.get('status1', 0)
-                    status2 = parsed.get('status2', 0)
-                    fpga_ok = parsed.get('fpga_system_status', False)
-                    echo_intensity = status2
-                    
-                    status_str = (
-                        f"FPGA={'OK' if fpga_ok else 'FAIL'}, "
-                        f"Echo={echo_intensity}, "
-                        f"Laser={'ON' if parsed.get('laser_light_output') else 'OFF'}, "
-                        f"5V6={'OK' if parsed.get('power_5v6_status') else 'FAIL'}"
-                    )
+                    status_str = f"FPGA:{parsed['status1']:08b}, Echo:{parsed['status2']}"
                     self._proto_box.append(f"[{ts}] [RX] SELF_CHECK: {status_str}")
-                    log_msg = f"✓ SELF_CHECK: {status_str}"
-                    
                 elif cmd in (0x02, 0x04):  # Range response
                     dist = parsed.get('distance', 'N/A')
                     status = parsed.get('status', 'N/A')
                     self._proto_box.append(f"[{ts}] [RX] RANGE: {dist}m (status: 0x{status:02X})")
-                    
                 elif cmd == 0x06:  # Anomaly
                     self._proto_box.append(f"[{ts}] [RX] ANOMALY: status1=0x{parsed['status1']:02X}")
-                    log_msg = f"⚠ ANOMALY: status=0x{parsed['status1']:02X}"
-                    
-                elif cmd == 0xA1:  # Set frequency response
-                    self._proto_box.append(f"[{ts}] [RX] FREQ_SET: OK")
-                    log_msg = "✓ Frequency set successfully"
-                    
-                elif cmd == 0xA2:  # Set MIN gate response
+                elif cmd in (0xA2, 0xA4):  # Gate responses
                     dist = parsed.get('gate_distance', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] GATE_MIN_SET: {dist}m")
-                    log_msg = f"✓ MIN gate set to {dist}m"
-                    
-                elif cmd == 0xA4:  # Set MAX gate response
+                    self._proto_box.append(f"[{ts}] [RX] GATE_SET: {dist}m")
+                elif cmd in (0xA3, 0xA5):  # Query gate responses
                     dist = parsed.get('gate_distance', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] GATE_MAX_SET: {dist}m")
-                    log_msg = f"✓ MAX gate set to {dist}m"
-                    
-                elif cmd == 0xA3:  # Query MIN gate response
-                    dist = parsed.get('gate_distance', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] GATE_MIN_QUERY: {dist}m")
-                    log_msg = f"✓ MIN gate: {dist}m"
-                    
-                elif cmd == 0xA5:  # Query MAX gate response
-                    dist = parsed.get('gate_distance', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] GATE_MAX_QUERY: {dist}m")
-                    log_msg = f"✓ MAX gate: {dist}m"
-                    
-                elif cmd == 0xA6:  # FPGA version
-                    ver = parsed.get('version', 'N/A')
-                    author = parsed.get('author', '')
-                    date = parsed.get('date', 0)
-                    month = parsed.get('month', 0)
-                    year = parsed.get('year', 0)
-                    self._proto_box.append(f"[{ts}] [RX] FPGA_VERSION: {ver} by {author} ({year}/{month:02d}/{date})")
-                    log_msg = f"✓ FPGA: {ver} by {author}"
-                    
-                elif cmd == 0xA7:  # MCU version
-                    ver = parsed.get('version', 'N/A')
-                    author = parsed.get('author', '')
-                    date = parsed.get('date', 0)
-                    month = parsed.get('month', 0)
-                    year = parsed.get('year', 0)
-                    self._proto_box.append(f"[{ts}] [RX] MCU_VERSION: {ver} by {author} ({year}/{month:02d}/{date})")
-                    log_msg = f"✓ MCU: {ver} by {author}"
-                    
-                elif cmd == 0xA8:  # HW version
-                    mb = parsed.get('motherboard', 'N/A')
-                    ct = parsed.get('control_board', 'N/A')
-                    apd = parsed.get('detection_board', 'N/A')
-                    ld = parsed.get('driver_board', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] HW_VERSION: MB={mb}, CT={ct}, APD={apd}, LD={ld}")
-                    log_msg = f"✓ HW: MB={mb}, CT={ct}, APD={apd}, LD={ld}"
-                    
+                    self._proto_box.append(f"[{ts}] [RX] GATE_QUERY: {dist}m")
+                elif cmd in (0xA6, 0xA7, 0xA8):  # Version responses
+                    self._proto_box.append(f"[{ts}] [RX] VERSION_INFO: cmd=0x{cmd:02X}")
                 elif cmd == 0xA9:  # SN response
-                    sn = parsed.get('serial_number', 'N/A')
-                    month = parsed.get('month', 0)
-                    year = parsed.get('year', 0)
-                    self._proto_box.append(f"[{ts}] [RX] SN: {sn} (MFG: {year}/{month:02d})")
-                    log_msg = f"✓ Serial Number: {sn}"
-                    
+                    sn = parsed.get('sn_number', 'N/A')
+                    self._proto_box.append(f"[{ts}] [RX] SN: {sn}")
                 elif cmd in (0x90, 0x91):  # Light count responses
                     count = parsed.get('light_count', 'N/A')
-                    count_type = "TOTAL" if cmd == 0x90 else "POWER_ON"
-                    self._proto_box.append(f"[{ts}] [RX] LIGHT_COUNT_{count_type}: {count}")
-                    log_msg = f"✓ {count_type} light count: {count}"
-                    
+                    self._proto_box.append(f"[{ts}] [RX] LIGHT_COUNT: {count}")
                 else:
                     self._proto_box.append(f"[{ts}] [RX] UNPARSED: {rx.hex(' ').upper()}")
-                
-                # Log to main log box if we have a message
-                if log_msg:
-                    self._log(log_msg)
             else:
                 self._proto_box.append(f"[{ts}] [RX] INVALID_FRAME: {rx.hex(' ').upper()}")
-                self._log(f"⚠ Invalid frame received: {rx.hex(' ').upper()}")
             
             sb = self._proto_box.verticalScrollBar()
             sb.setValue(sb.maximum())
@@ -1479,63 +1277,53 @@ class MainWindow(QMainWindow):
     def _apply_gate(self):
         mn, mx = self._min_gate.value(), self._max_gate.value()
         if mn >= mx: self._log("⚠  MIN must be < MAX"); return
-        if not self._connected:
-            self._log("⚠  Not connected"); return
-        frame_min = cmd_set_min_gate(mn)
-        frame_max = cmd_set_max_gate(mx)
-        self._proto_box.append("[TX] SET_MIN_GATE: " + frame_min.hex(" ").upper())
-        self._proto_box.append("[TX] SET_MAX_GATE: " + frame_max.hex(" ").upper())
+        if self._connected:
+            self._worker.send(cmd_set_min_gate(mn))
+            self._worker.send(cmd_set_max_gate(mx))
         self._log(f"Gate → {mn} m … {mx} m")
-        threading.Thread(target=lambda: (self._worker.send_and_recv(frame_min), self._worker.send_and_recv(frame_max)), daemon=True).start()
 
     # ── Device info queries ────────────────────────────────────────────────────
     def _query_min_gate(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_min_gate()
-        self._worker.send_and_recv(frame)
+        self._worker.send(frame)
         self._proto_box.append("[TX] QUERY_MIN_GATE: " + frame.hex(" ").upper())
-        self._log("Querying MIN gate...")
 
     def _query_max_gate(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_max_gate()
-        self._worker.send_and_recv(frame)
+        self._worker.send(frame)
         self._proto_box.append("[TX] QUERY_MAX_GATE: " + frame.hex(" ").upper())
-        self._log("Querying MAX gate...")
 
     def _query_fpga_version(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_fpga_version()
-        self._worker.send_and_recv(frame)
+        self._worker.send(frame)
         self._proto_box.append("[TX] QUERY_FPGA_VERSION: " + frame.hex(" ").upper())
-        self._log("Querying FPGA version...")
 
     def _query_mcu_version(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_mcu_version()
-        self._worker.send_and_recv(frame)
+        self._worker.send(frame)
         self._proto_box.append("[TX] QUERY_MCU_VERSION: " + frame.hex(" ").upper())
-        self._log("Querying MCU version...")
 
     def _query_hw_version(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_hw_version()
-        self._worker.send_and_recv(frame)
+        self._worker.send(frame)
         self._proto_box.append("[TX] QUERY_HW_VERSION: " + frame.hex(" ").upper())
-        self._log("Querying HW version...")
 
     def _query_sn(self):
         if not self._connected:
             self._log("⚠  Not connected"); return
         frame = cmd_query_sn()
-        self._worker.send_and_recv(frame)
+        self._worker.send(frame)
         self._proto_box.append("[TX] QUERY_SN: " + frame.hex(" ").upper())
-        self._log("Querying Serial Number...")
 
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _stat_box(self, label: str, value: str) -> QFrame:
@@ -1550,19 +1338,6 @@ class MainWindow(QMainWindow):
 
     def _update_stat(self, f: QFrame, text: str):
         f._vl.setText(text)
-
-    def _apply_camera_settings(self):
-        """Применить настройки IP-камеры"""
-        ip = self._cam_ip_edit.text().strip()
-        user = self._cam_user_edit.text().strip()
-        password = self._cam_pass_edit.text().strip()
-        
-        if not ip:
-            self._log("⚠  Camera IP address is required")
-            return
-            
-        self._camera.set_camera_credentials(ip, user, password)
-        self._log(f"✓ Camera settings applied: {ip}")
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
