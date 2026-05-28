@@ -20,11 +20,22 @@ from PyQt6.QtWidgets import (
     QGridLayout, QPushButton, QLabel, QComboBox, QSpinBox,
     QTextEdit, QGroupBox, QFrame, QSlider, QTabWidget, QLineEdit, QStackedWidget, QRadioButton, QButtonGroup
 )
-from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal, QObject
+from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal, QObject, QUrl
 from PyQt6.QtGui import (
-    QPainter, QPen, QBrush, QColor, QFont,
+    QPainter, QPen, QBrush, QColor, QFont, QPixmap, QImage,
     QLinearGradient, QConicalGradient, QPainterPath
 )
+
+# Попытка импортировать QtMultimedia для камеры
+try:
+    from PyQt6.QtMultimedia import QCamera, QMediaDevice, QCaptureSession
+    from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
+    HAS_MULTIMEDIA = True
+except ImportError:
+    HAS_MULTIMEDIA = False
+
+# Для HTTP-потока камеры
+import urllib.request
 
 # ── Colours ──────────────────────────────────────────────────────────────────
 BG_DARK      = QColor("#0A0E17")
@@ -535,73 +546,133 @@ class CommWorker(QObject):
             self.error.emit(str(e))
 
 # ── Custom widgets ────────────────────────────────────────────────────────────
-class RadarWidget(QWidget):
+class CameraWidget(QWidget):
+    """Виджет для отображения потока IP-камеры с центральной меткой цели"""
+    
+    frame_updated = pyqtSignal(QPixmap)
+    
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(290, 290)
-        self._sweep = 0.0
-        self._blips: list[tuple[float, float, float]] = []
+        self._camera_ip = "192.168.1.168"
+        self._camera_user = "admin"
+        self._camera_pass = "123456"
+        self._current_pixmap = QPixmap()
+        self._target_distance = 0.0
         self._max_dist = 4200.0
-        t = QTimer(self); t.timeout.connect(self._tick); t.start(30)
-
-    def add_blip(self, dist: float):
-        norm = min(dist / self._max_dist, 1.0)
-        self._blips.append((math.radians(self._sweep), norm, 1.0))
-        self._blips = self._blips[-80:]
-
-    def _tick(self):
-        self._sweep = (self._sweep + 1.5) % 360
-        self._blips = [(a, d, age - 0.015) for a, d, age in self._blips if age > 0]
+        
+        # Таймер для обновления кадра
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._fetch_frame)
+        self._update_timer.start(500)  # Обновление каждые 500мс
+        
+        # Метка для отображения расстояния
+        self._distance_label = QLabel("0.0 m", self)
+        self._distance_label.setStyleSheet(
+            "color: #00FF88; font-size: 24px; font-weight: bold; "
+            "background: rgba(10, 14, 23, 0.7); padding: 8px 16px; "
+            "border-radius: 4px; border: 1px solid #00FF88;"
+        )
+        self._distance_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._distance_label.hide()
+        
+        # Метка цели в центре
+        self._target_label = QLabel("⊕", self)
+        self._target_label.setStyleSheet(
+            "color: #FF3B5C; font-size: 32px; font-weight: bold;"
+        )
+        self._target_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+    def set_camera_credentials(self, ip: str, user: str, password: str):
+        """Установить учетные данные камеры"""
+        self._camera_ip = ip
+        self._camera_user = user
+        self._camera_pass = password
+        self._log(f"Camera credentials updated: {ip}")
+        
+    def _fetch_frame(self):
+        """Получить кадр с IP-камеры через HTTP"""
+        try:
+            # Формируем URL для MJPEG потока (типичный для многих IP-камер)
+            # Для Hikvision/Dahua может потребоваться другой формат
+            url = f"http://{self._camera_user}:{self._camera_pass}@{self._camera_ip}/Streaming/Channels/101"
+            
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=2) as response:
+                # Читаем данные изображения
+                image_data = response.read()
+                
+                if image_data:
+                    image = QImage()
+                    if image.loadFromData(image_data):
+                        pixmap = QPixmap.fromImage(image)
+                        self._current_pixmap = pixmap.scaled(
+                            self.size(), 
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation
+                        )
+                        self.frame_updated.emit(self._current_pixmap)
+                        self.update()
+                        
+        except Exception as e:
+            # При ошибке показываем заглушку
+            self._current_pixmap = QPixmap()
+            self.update()
+    
+    def set_target_distance(self, distance: float):
+        """Установить расстояние до цели"""
+        self._target_distance = distance
+        self._distance_label.setText(f"{distance:.1f} m")
+        self._distance_label.show()
         self.update()
-
-    def paintEvent(self, _):
+    
+    def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w, h = self.width(), self.height()
-        cx, cy = w / 2, h / 2
-        r = min(cx, cy) - 6
+        
+        # Заполняем фон
         p.fillRect(self.rect(), BG_DARK)
-
-        # rings + cross
-        p.setPen(QPen(GRID_LINE, 1))
-        for i in range(1, 5):
-            rr = r * i / 4
-            p.drawEllipse(QPointF(cx, cy), rr, rr)
-        p.drawLine(int(cx), int(cy - r), int(cx), int(cy + r))
-        p.drawLine(int(cx - r), int(cy), int(cx + r), int(cy))
-
-        # labels
-        p.setFont(QFont("Courier New", 7))
-        for i, lbl in enumerate(["1050", "2100", "3150", "4200"], 1):
-            p.setPen(QPen(TEXT_DIM))
-            p.drawText(int(cx + r * i / 4 + 2), int(cy - 2), lbl + "m")
-
-        # sweep fan
-        sg = QConicalGradient(cx, cy, -self._sweep)
-        c1 = QColor(ACCENT_CYAN); c1.setAlpha(110)
-        c2 = QColor(ACCENT_CYAN); c2.setAlpha(0)
-        sg.setColorAt(0.0, c1); sg.setColorAt(0.18, c2); sg.setColorAt(1.0, c2)
-        p.setBrush(QBrush(sg)); p.setPen(Qt.PenStyle.NoPen)
-        p.drawEllipse(QPointF(cx, cy), r, r)
-
-        # sweep line
-        sx = cx + r * math.cos(math.radians(-self._sweep))
-        sy = cy + r * math.sin(math.radians(-self._sweep))
-        p.setPen(QPen(ACCENT_CYAN, 1.5))
-        p.drawLine(QPointF(cx, cy), QPointF(sx, sy))
-
-        # blips
-        for angle, norm, age in self._blips:
-            bx = cx + r * norm * math.cos(angle)
-            by = cy - r * norm * math.sin(angle)
-            col = QColor(ACCENT_GREEN); col.setAlpha(int(age * 230))
-            p.setBrush(QBrush(col)); p.setPen(Qt.PenStyle.NoPen)
-            p.drawEllipse(QPointF(bx, by), 5, 5)
-
-        # rim
+        
+        # Рисуем кадр камеры если есть
+        if not self._current_pixmap.isNull():
+            # Центрируем изображение
+            px_rect = self._current_pixmap.rect()
+            px_rect.moveCenter(self.rect().center())
+            p.drawPixmap(px_rect, self._current_pixmap)
+        else:
+            # Показываем заглушку если нет изображения
+            p.setPen(QPen(TEXT_DIM, 2))
+            p.setFont(QFont("Courier New", 14))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, 
+                      f"IP CAMERA\n{self._camera_ip}\nNo Signal")
+        
+        # Рисуем прицельную метку в центре
+        cx, cy = self.width() // 2, self.height() // 2
+        
+        # Внешний круг
+        p.setPen(QPen(ACCENT_RED, 2))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(ACCENT_CYAN, 1.5))
-        p.drawEllipse(QPointF(cx, cy), r, r)
+        p.drawEllipse(QPointF(cx, cy), 25, 25)
+        
+        # Внутренний круг
+        p.setPen(QPen(ACCENT_RED, 1))
+        p.drawEllipse(QPointF(cx, cy), 15, 15)
+        
+        # Перекрестие
+        p.drawLine(cx - 30, cy, cx + 30, cy)
+        p.drawLine(cx, cy - 30, cx, cy + 30)
+        
+        # Точка в центре
+        p.setBrush(QBrush(ACCENT_RED))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawEllipse(QPointF(cx, cy), 3, 3)
+        
+        # Метка расстояния внизу
+        if self._target_distance > 0:
+            label_x = cx - 60
+            label_y = cy + 50
+            self._distance_label.setGeometry(label_x, label_y, 120, 40)
+            self._distance_label.raise_()
+        
         p.end()
 
 
@@ -1010,11 +1081,38 @@ class MainWindow(QMainWindow):
         right = QVBoxLayout(); right.setSpacing(8)
         root.addLayout(right, 0)
 
-        rl = QLabel("RADAR VIEW")
+        rl = QLabel("IP CAMERA VIEW")
         rl.setStyleSheet("color:#4A6080;font-size:9px;letter-spacing:3px;")
         right.addWidget(rl)
-        self._radar = RadarWidget(); self._radar.setFixedWidth(295)
-        right.addWidget(self._radar)
+        
+        # Camera settings group
+        cam_settings = QGroupBox("CAMERA SETTINGS")
+        cam_layout = QGridLayout(cam_settings)
+        
+        cam_layout.addWidget(QLabel("IP Address"), 0, 0)
+        self._cam_ip_edit = QLineEdit("192.168.1.168")
+        cam_layout.addWidget(self._cam_ip_edit, 0, 1)
+        
+        cam_layout.addWidget(QLabel("Username"), 1, 0)
+        self._cam_user_edit = QLineEdit("admin")
+        cam_layout.addWidget(self._cam_user_edit, 1, 1)
+        
+        cam_layout.addWidget(QLabel("Password"), 2, 0)
+        self._cam_pass_edit = QLineEdit("123456")
+        self._cam_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        cam_layout.addWidget(self._cam_pass_edit, 2, 1)
+        
+        apply_cam_btn = QPushButton("APPLY CAMERA")
+        apply_cam_btn.clicked.connect(self._apply_camera_settings)
+        cam_layout.addWidget(apply_cam_btn, 3, 0, 1, 2)
+        
+        right.addWidget(cam_settings)
+        
+        # Camera widget with crosshair
+        self._camera = CameraWidget()
+        self._camera.setFixedWidth(295)
+        self._camera.setFixedHeight(295)
+        right.addWidget(self._camera)
 
         info_box = QGroupBox("DEVICE SPECS"); il = QGridLayout(info_box)
         specs = [("WAVELENGTH","1535 ± 5 nm"),("MAX RANGE","4200 m"),
@@ -1179,7 +1277,8 @@ class MainWindow(QMainWindow):
         if len(self._history) > 1000: self._history = self._history[-1000:]
         self._big_disp.set_value(dist)
         self._chart.push(dist)
-        self._radar.add_blip(dist)
+        # Обновляем камеру вместо радара
+        self._camera.set_target_distance(dist)
         
         # Update LEDs - we have a valid distance so both laser and echo should be active
         self._led_laser.set_on(True)
@@ -1398,6 +1497,19 @@ class MainWindow(QMainWindow):
 
     def _update_stat(self, f: QFrame, text: str):
         f._vl.setText(text)
+
+    def _apply_camera_settings(self):
+        """Применить настройки IP-камеры"""
+        ip = self._cam_ip_edit.text().strip()
+        user = self._cam_user_edit.text().strip()
+        password = self._cam_pass_edit.text().strip()
+        
+        if not ip:
+            self._log("⚠  Camera IP address is required")
+            return
+            
+        self._camera.set_camera_credentials(ip, user, password)
+        self._log(f"✓ Camera settings applied: {ip}")
 
     def _log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S")
