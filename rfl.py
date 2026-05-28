@@ -110,27 +110,36 @@ def cmd_set_baud_rate(baud_code: int) -> bytes:
 
 def parse_response_frame(data: bytes) -> dict | None:
     """Parse a response frame according to the protocol specification."""
-    if len(data) < 6:  # Минимальный размер заголовка
+    if len(data) < 6:  # Минимальный размер фрейма: header(2) + length(1) + device(1) + cmd(1) + checksum(1) = 6
         return None
     if data[0] != 0xEE or data[1] != 0x16:
         return None
     
-    length = data[2]
-    if len(data) < length + 4:  # Заголовок (2) + длина (1) + тело + чек-сумма (1)
+    length = data[2]  # Длина тела (device + cmd + params)
+    
+    # Полный размер фрейма: header(2) + length(1) + body(length) + checksum(1) = 4 + length
+    expected_length = 4 + length
+    
+    if len(data) < expected_length:
         return None
 
+    # Извлекаем компоненты
+    device_code = data[3]  # Должно быть 0x03
     cmd = data[4]
-    params = data[5:2+length+1]  # Параметры после команды до чек-суммы
-    received_checksum = data[2+length+1]
+    params = data[5:3+length]  # Параметры после команды (длина = length - 2)
+    checksum_idx = 3 + length  # Индекс чек-суммы
+    received_checksum = data[checksum_idx]
 
-    # Проверяем чек-сумму
-    calculated_checksum = sum(data[3:2+length+1]) & 0xFF
+    # Проверяем чек-сумму: сумма всех байт от device_code до последнего параметра
+    checksum_data = data[3:checksum_idx]  # Device code + Command code + Params
+    calculated_checksum = sum(checksum_data) & 0xFF
+    
     if received_checksum != calculated_checksum:
         return None
 
     result = {
         'cmd': cmd,
-        'params': params,
+        'params': list(params),
         'raw_data': data
     }
 
@@ -559,11 +568,12 @@ class CameraWidget(QWidget):
         self._current_pixmap = QPixmap()
         self._target_distance = 0.0
         self._max_dist = 4200.0
+        self._frame_count = 0
         
         # Таймер для обновления кадра
         self._update_timer = QTimer(self)
         self._update_timer.timeout.connect(self._fetch_frame)
-        self._update_timer.start(500)  # Обновление каждые 500мс
+        self._update_timer.start(1000)  # Обновление каждые 1000мс (медленнее для стабильности)
         
         # Метка для отображения расстояния
         self._distance_label = QLabel("0.0 m", self)
@@ -587,36 +597,79 @@ class CameraWidget(QWidget):
         self._camera_ip = ip
         self._camera_user = user
         self._camera_pass = password
-        self._log(f"Camera credentials updated: {ip}")
         
     def _fetch_frame(self):
-        """Получить кадр с IP-камеры через HTTP"""
+        """Получить кадр с IP-камеры через HTTP MJPEG stream"""
         try:
-            # Формируем URL для MJPEG потока (типичный для многих IP-камер)
-            # Для Hikvision/Dahua может потребоваться другой формат
-            url = f"http://{self._camera_user}:{self._camera_pass}@{self._camera_ip}/Streaming/Channels/101"
+            # Пробуем разные форматы URL для разных производителей камер
+            urls_to_try = [
+                f"http://{self._camera_ip}/Streaming/Channels/101",  # Hikvision
+                f"http://{self._camera_ip}/video",  # Общий
+                f"http://{self._camera_ip}/mjpg/video.cgi",  # Некоторые камеры
+            ]
             
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=2) as response:
-                # Читаем данные изображения
-                image_data = response.read()
-                
-                if image_data:
-                    image = QImage()
-                    if image.loadFromData(image_data):
-                        pixmap = QPixmap.fromImage(image)
-                        self._current_pixmap = pixmap.scaled(
-                            self.size(), 
-                            Qt.AspectRatioMode.KeepAspectRatio,
-                            Qt.TransformationMode.SmoothTransformation
-                        )
-                        self.frame_updated.emit(self._current_pixmap)
-                        self.update()
+            # Добавляем аутентификацию через заголовок вместо URL
+            import base64
+            auth_string = f"{self._camera_user}:{self._camera_pass}"
+            auth_bytes = base64.b64encode(auth_string.encode()).decode()
+            
+            pixmap_loaded = False
+            
+            for url in urls_to_try:
+                try:
+                    req = urllib.request.Request(url)
+                    req.add_header('Authorization', f'Basic {auth_bytes}')
+                    
+                    with urllib.request.urlopen(req, timeout=3) as response:
+                        # Читаем данные - пытаемся найти JPEG кадр
+                        chunk_size = 1024
+                        data = bytearray()
+                        jpeg_start = b'\xff\xd8'
+                        jpeg_end = b'\xff\xd9'
                         
+                        # Читаем часть потока
+                        for _ in range(50):  # Максимум 50 итераций
+                            chunk = response.read(chunk_size)
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                            
+                            # Ищем начало и конец JPEG
+                            start_idx = data.find(jpeg_start)
+                            end_idx = data.find(jpeg_end, start_idx)
+                            
+                            if start_idx != -1 and end_idx != -1:
+                                jpeg_data = bytes(data[start_idx:end_idx+2])
+                                
+                                image = QImage()
+                                if image.loadFromData(jpeg_data, 'JPEG'):
+                                    self._current_pixmap = QPixmap.fromImage(image).scaled(
+                                        self.size(), 
+                                        Qt.AspectRatioMode.KeepAspectRatio,
+                                        Qt.TransformationMode.SmoothTransformation
+                                    )
+                                    self.frame_updated.emit(self._current_pixmap)
+                                    self.update()
+                                    self._frame_count += 1
+                                    pixmap_loaded = True
+                                    break
+                        
+                        if pixmap_loaded:
+                            break
+                            
+                except Exception:
+                    continue  # Пробуем следующий URL
+            
+            # Если ни один URL не сработал - показываем заглушку
+            if not pixmap_loaded and self._frame_count == 0:
+                self._current_pixmap = QPixmap()
+                self.update()
+                
         except Exception as e:
-            # При ошибке показываем заглушку
-            self._current_pixmap = QPixmap()
-            self.update()
+            # При ошибке показываем заглушку только если еще не было успешных кадров
+            if self._frame_count == 0:
+                self._current_pixmap = QPixmap()
+                self.update()
     
     def set_target_distance(self, distance: float):
         """Установить расстояние до цели"""
