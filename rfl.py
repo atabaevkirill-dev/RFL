@@ -8,6 +8,7 @@ import sys
 import math
 import struct
 import threading
+import socket
 from datetime import datetime
 from collections import deque
 
@@ -17,7 +18,7 @@ import serial.tools.list_ports
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGridLayout, QPushButton, QLabel, QComboBox, QSpinBox,
-    QTextEdit, QGroupBox, QFrame, QSlider, QTabWidget
+    QTextEdit, QGroupBox, QFrame, QSlider, QTabWidget, QLineEdit, QStackedWidget, QRadioButton, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal, QObject
 from PyQt6.QtGui import (
@@ -130,6 +131,18 @@ def parse_response_frame(data: bytes) -> dict | None:
             result['status1'] = params[2]  # Битовые флаги статуса
             result['status0'] = params[3]  # Статус питания
             
+            # Расшифровка битовых флагов
+            status1 = params[2]
+            result['fpga_system_status'] = bool(status1 & 0x01)
+            result['laser_light_output'] = bool(status1 & 0x02)
+            result['main_wave_detection'] = bool(status1 & 0x04)
+            result['echo_detection'] = bool(status1 & 0x08)
+            result['bias_switch'] = bool(status1 & 0x10)
+            result['bias_output'] = bool(status1 & 0x20)
+            result['temperature_state'] = bool(status1 & 0x40)
+            result['light_output_off'] = bool(status1 & 0x80)
+            result['power_5v6_status'] = bool(params[3] & 0x01)
+            
     elif cmd in (0x02, 0x04):  # Single or continuous ranging response
         if len(params) >= 4:
             result['status'] = params[0]
@@ -172,24 +185,48 @@ def parse_response_frame(data: bytes) -> dict | None:
 
     elif cmd in (0xA6, 0xA7):  # Query FPGA/MCU version response
         if len(params) >= 4:
-            result['version'] = params[0]
-            result['date'] = params[1]
-            result['month_year'] = params[2]
-            result['author'] = params[3]
+            version_byte, date, month_year, author = params
+            
+            major = (version_byte >> 4) & 0x0F
+            minor = version_byte & 0x0F
+            month = (month_year >> 4) & 0x0F
+            year = 2020 + (month_year & 0x0F)
+            
+            authors_fpga = {0x6C: "cliu", 0x5D: "dwu", 0xCC: "cycheng"}
+            authors_mcu = {0x00: "jyang", 0xF1: "llfu", 0x01: "zqxiong"}
+            authors = {**authors_fpga, **authors_mcu}
+            
+            result['version'] = f"V{major}.{minor}"
+            result['date'] = date
+            result['month'] = month
+            result['year'] = year
+            result['author'] = authors.get(author, f"Unknown(0x{author:02X})")
 
     elif cmd == 0xA8:  # Query HW version response
         if len(params) >= 4:
-            result['mbvs'] = params[0]  # Motherboard version
-            result['ctvs'] = params[1]  # Control board version
-            result['apdvs'] = params[2]  # Detection board version
-            result['ldvs'] = params[3]  # Driver board version
+            mbvs, ctvs, apdvs, ldvs = params
+            
+            def decode_version(v):
+                major = (v >> 4) & 0x0F
+                minor = v & 0x0F
+                return f"V{major}.{minor}"
+            
+            result['motherboard'] = decode_version(mbvs)
+            result['control_board'] = decode_version(ctvs)
+            result['detection_board'] = decode_version(apdvs)
+            result['driver_board'] = decode_version(ldvs)
 
     elif cmd == 0xA9:  # Query SN response
-        if len(params) >= 5:
-            result['month_year'] = params[0]
-            result['num_high'] = params[1]
-            result['num_low'] = params[2]
-            result['sn_number'] = (params[1] << 8) | params[2]
+        if len(params) >= 3:
+            month_year, num_high, num_low = params
+            
+            month = (month_year >> 4) & 0x0F
+            year = 2020 + (month_year & 0x0F)
+            sn = (num_high << 8) | num_low
+            
+            result['month'] = month
+            result['year'] = year
+            result['serial_number'] = f"{year:04d}{month:02d}{sn:04d}"
 
     elif cmd in (0x90, 0x91):  # Query light count response
         if len(params) >= 3:
@@ -204,8 +241,8 @@ def parse_range_response(data: bytes) -> float | None:
         return parsed['distance']
     return None
 
-# ── Serial worker (runs in thread) ───────────────────────────────────────────
-class SerialWorker(QObject):
+# ── Serial/TCP worker (runs in thread) ───────────────────────────────────────
+class CommWorker(QObject):
     distance_received = pyqtSignal(float)
     raw_frame         = pyqtSignal(bytes, bytes)   # tx, rx
     error             = pyqtSignal(str)
@@ -214,34 +251,68 @@ class SerialWorker(QObject):
     def __init__(self):
         super().__init__()
         self._ser: serial.Serial | None = None
+        self._sock: socket.socket | None = None
+        self._is_tcp = False
         self._lock = threading.Lock()
         self._buf = bytearray()
 
-    def connect(self, port: str, baud: int) -> bool:
+    def connect_serial(self, port: str, baud: int) -> bool:
         try:
             self._ser = serial.Serial(port, baud, timeout=1.0)
+            self._is_tcp = False
             self.connected.emit(True)
             return True
         except Exception as e:
             self.error.emit(f"Cannot open {port}: {e}")
             return False
 
+    def connect_tcp(self, host: str, port: int) -> bool:
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.settimeout(1.0)
+            self._sock.connect((host, port))
+            self._is_tcp = True
+            self.connected.emit(True)
+            return True
+        except Exception as e:
+            self.error.emit(f"Cannot connect to {host}:{port}: {e}")
+            return False
+
     def disconnect(self):
         if self._ser and self._ser.is_open:
             self._ser.close()
+        if self._sock:
+            try:
+                self._sock.close()
+            except:
+                pass
         self._ser = None
+        self._sock = None
         self.connected.emit(False)
 
     def send(self, frame: bytes):
-        if not self._ser or not self._ser.is_open:
-            self.error.emit("Not connected")
-            return
-        with self._lock:
-            self._ser.write(frame)
-            self._ser.flush()
+        if self._is_tcp:
+            if not self._sock:
+                self.error.emit("Not connected (TCP)")
+                return
+            with self._lock:
+                self._sock.sendall(frame)
+        else:
+            if not self._ser or not self._ser.is_open:
+                self.error.emit("Not connected (Serial)")
+                return
+            with self._lock:
+                self._ser.write(frame)
+                self._ser.flush()
 
     def send_and_recv(self, frame: bytes):
         """Send a command and collect the response frame."""
+        if self._is_tcp:
+            self._send_and_recv_tcp(frame)
+        else:
+            self._send_and_recv_serial(frame)
+
+    def _send_and_recv_serial(self, frame: bytes):
         if not self._ser or not self._ser.is_open:
             self.error.emit("Not connected")
             return
@@ -283,8 +354,82 @@ class SerialWorker(QObject):
                 elif parsed['cmd'] == 0x06:  # Anomaly
                     self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
 
+    def _send_and_recv_tcp(self, frame: bytes):
+        if not self._sock:
+            self.error.emit("Not connected (TCP)")
+            return
+        with self._lock:
+            self._sock.sendall(frame)
+            # Определяем ожидаемую длину ответа
+            cmd = frame[3]
+            
+            if cmd in [0x01, 0x02, 0x04]:
+                expected_len = 10
+            elif cmd in [0x03, 0x05]:
+                expected_len = 6
+            elif cmd in [0xA1]:
+                expected_len = 6
+            elif cmd in [0xA2, 0xA3, 0xA4, 0xA5]:
+                expected_len = 8
+            elif cmd in [0xA6, 0xA7, 0xA8]:
+                expected_len = 10
+            elif cmd == 0xA9:
+                expected_len = 9
+            elif cmd in [0x90, 0x91]:
+                expected_len = 9
+            else:
+                expected_len = 10
+            
+            import time
+            time.sleep(0.05)
+            
+            # Читаем заголовок и длину
+            header = bytearray()
+            while len(header) < 3:
+                try:
+                    chunk = self._sock.recv(3 - len(header))
+                    if not chunk:
+                        self.error.emit("TCP connection closed")
+                        return
+                    header.extend(chunk)
+                except socket.timeout:
+                    self.error.emit("TCP read timeout")
+                    return
+            
+            if header[0] != 0xEE or header[1] != 0x16:
+                self.error.emit(f"Invalid TCP header: {header[:2].hex()}")
+                return
+            
+            length = header[2]
+            remaining = length + 1  # тело + чексумма
+            
+            raw = bytearray(header)
+            while len(raw) < 3 + length + 1:
+                try:
+                    chunk = self._sock.recv(3 + length + 1 - len(raw))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                except socket.timeout:
+                    break
+            
+            self.raw_frame.emit(frame, bytes(raw))
+            
+            parsed = parse_response_frame(bytes(raw))
+            if parsed:
+                if parsed['cmd'] in (0x02, 0x04) and 'distance' in parsed and not parsed.get('out_of_range', False):
+                    self.distance_received.emit(parsed['distance'])
+                elif parsed['cmd'] == 0x06:
+                    self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
+
     def read_pending(self):
         """Called by timer — drain incoming bytes and parse frames."""
+        if self._is_tcp:
+            self._read_pending_tcp()
+        else:
+            self._read_pending_serial()
+
+    def _read_pending_serial(self):
         if not self._ser or not self._ser.is_open:
             return
         try:
@@ -337,6 +482,55 @@ class SerialWorker(QObject):
                     else:
                         # Если не удалось распарсить, отправляем необработанный фрейм для диагностики
                         self.raw_frame.emit(b'', frame)
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _read_pending_tcp(self):
+        if not self._sock:
+            return
+        try:
+            self._sock.setblocking(False)
+            try:
+                data = self._sock.recv(4096)
+                if not data:
+                    self.error.emit("TCP connection closed")
+                    self.disconnect()
+                    return
+                self._buf += data
+                
+                # Обработка буфера по полным фреймам
+                while len(self._buf) >= 6:
+                    idx = self._buf.find(b'\xEE\x16')
+                    if idx < 0:
+                        if len(self._buf) > 100:
+                            self._buf.clear()
+                        break
+                    if idx > 0:
+                        self._buf = self._buf[idx:]
+                    
+                    if len(self._buf) < 3:
+                        break
+                    
+                    length = self._buf[2]
+                    expected_length = 3 + length + 1
+                    
+                    if len(self._buf) < expected_length:
+                        break
+                    
+                    frame = bytes(self._buf[:expected_length])
+                    self._buf = self._buf[expected_length:]
+                    
+                    parsed = parse_response_frame(frame)
+                    if parsed:
+                        if parsed['cmd'] in (0x02, 0x04) and 'distance' in parsed and not parsed.get('out_of_range', False):
+                            self.distance_received.emit(parsed['distance'])
+                        elif parsed['cmd'] == 0x06:
+                            self.error.emit(f"Ranging anomaly detected: status=0x{parsed['status1']:02X}")
+                        self.raw_frame.emit(b'', frame)
+                    else:
+                        self.raw_frame.emit(b'', frame)
+            except BlockingIOError:
+                pass  # Нет данных
         except Exception as e:
             self.error.emit(str(e))
 
@@ -585,7 +779,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 820)
         self.setStyleSheet(STYLE)
 
-        self._worker = SerialWorker()
+        self._worker = CommWorker()
         self._worker.distance_received.connect(self._on_distance)
         self._worker.raw_frame.connect(self._on_raw_frame)
         self._worker.error.connect(self._on_error)
@@ -595,6 +789,7 @@ class MainWindow(QMainWindow):
         self._continuous = False
         self._history: list[float] = []
         self._shot_count = 0
+        self._connection_mode = "serial"  # "serial" или "tcp"
 
         # Timer to drain serial RX in continuous mode
         self._rx_timer = QTimer(self)
@@ -628,6 +823,25 @@ class MainWindow(QMainWindow):
         # Connection
         cb = QGroupBox("CONNECTION"); cl = QVBoxLayout(cb); cl.setSpacing(6)
 
+        # Mode selection (Serial / TCP)
+        mode_row = QHBoxLayout()
+        self._serial_radio = QRadioButton("SERIAL")
+        self._tcp_radio = QRadioButton("TCP/IP")
+        self._serial_radio.setChecked(True)
+        self._mode_group = QButtonGroup(self)
+        self._mode_group.addButton(self._serial_radio)
+        self._mode_group.addButton(self._tcp_radio)
+        self._serial_radio.toggled.connect(self._on_mode_changed)
+        mode_row.addWidget(self._serial_radio)
+        mode_row.addWidget(self._tcp_radio)
+        cl.addLayout(mode_row)
+
+        # Serial settings
+        self._serial_widget = QWidget()
+        serial_layout = QVBoxLayout(self._serial_widget)
+        serial_layout.setContentsMargins(0, 4, 0, 0)
+        serial_layout.setSpacing(6)
+        
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("PORT"))
         self._port_cb = QComboBox(); self._port_cb.setMinimumWidth(130)
@@ -636,14 +850,40 @@ class MainWindow(QMainWindow):
         refresh_btn.setFixedWidth(30); refresh_btn.setToolTip("Refresh ports")
         refresh_btn.clicked.connect(self._refresh_ports)
         port_row.addWidget(refresh_btn)
-        cl.addLayout(port_row)
+        serial_layout.addLayout(port_row)
 
         baud_row = QHBoxLayout()
         baud_row.addWidget(QLabel("BAUD"))
         self._baud_cb = QComboBox()
         self._baud_cb.addItems(["115200", "57600", "9600"])
         baud_row.addWidget(self._baud_cb, 1)
-        cl.addLayout(baud_row)
+        serial_layout.addLayout(baud_row)
+        
+        cl.addWidget(self._serial_widget)
+
+        # TCP settings
+        self._tcp_widget = QWidget()
+        tcp_layout = QVBoxLayout(self._tcp_widget)
+        tcp_layout.setContentsMargins(0, 4, 0, 0)
+        tcp_layout.setSpacing(6)
+        self._tcp_widget.setVisible(False)
+        
+        host_row = QHBoxLayout()
+        host_row.addWidget(QLabel("HOST"))
+        self._host_edit = QLineEdit("192.168.1.100")
+        self._host_edit.setPlaceholderText("IP address")
+        host_row.addWidget(self._host_edit, 1)
+        tcp_layout.addLayout(host_row)
+        
+        tcpport_row = QHBoxLayout()
+        tcpport_row.addWidget(QLabel("PORT"))
+        self._tcp_port_spin = QSpinBox()
+        self._tcp_port_spin.setRange(1, 65535)
+        self._tcp_port_spin.setValue(8888)
+        tcpport_row.addWidget(self._tcp_port_spin, 1)
+        tcp_layout.addLayout(tcpport_row)
+        
+        cl.addWidget(self._tcp_widget)
 
         self._conn_btn = QPushButton("⚡  CONNECT")
         self._conn_btn.setObjectName("green")
@@ -790,8 +1030,24 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("STATUS: OFFLINE  |  SELECT PORT AND CONNECT")
 
+    # ── Mode change handler ───────────────────────────────────────────────────
+    def _on_mode_changed(self):
+        if self._serial_radio.isChecked():
+            self._connection_mode = "serial"
+            self._serial_widget.setVisible(True)
+            self._tcp_widget.setVisible(False)
+            self._refresh_ports()
+            self._log("Connection mode: SERIAL")
+        else:
+            self._connection_mode = "tcp"
+            self._serial_widget.setVisible(False)
+            self._tcp_widget.setVisible(True)
+            self._log("Connection mode: TCP/IP")
+
     # ── Port refresh ──────────────────────────────────────────────────────────
     def _refresh_ports(self):
+        if self._connection_mode != "serial":
+            return
         self._port_cb.clear()
         ports = serial.tools.list_ports.comports()
         if not ports:
@@ -808,11 +1064,17 @@ class MainWindow(QMainWindow):
     # ── Connection ────────────────────────────────────────────────────────────
     def _toggle_connect(self):
         if not self._connected:
-            idx = self._port_cb.currentIndex()
-            port = self._port_cb.itemData(idx) or self._port_cb.currentText().split()[0]
-            baud = int(self._baud_cb.currentText())
-            self._log(f"Connecting to {port} @ {baud} bps …")
-            self._worker.connect(port, baud)
+            if self._connection_mode == "serial":
+                idx = self._port_cb.currentIndex()
+                port = self._port_cb.itemData(idx) or self._port_cb.currentText().split()[0]
+                baud = int(self._baud_cb.currentText())
+                self._log(f"Connecting to {port} @ {baud} bps …")
+                self._worker.connect_serial(port, baud)
+            else:
+                host = self._host_edit.text().strip()
+                port = self._tcp_port_spin.value()
+                self._log(f"Connecting to {host}:{port} …")
+                self._worker.connect_tcp(host, port)
         else:
             self._stop_ranging()
             self._worker.disconnect()
@@ -825,9 +1087,14 @@ class MainWindow(QMainWindow):
             self._conn_btn.setObjectName("red"); self._conn_btn.setStyle(self._conn_btn.style())
             self._single_btn.setEnabled(True)
             self._cont_btn.setEnabled(True)
-            port = self._port_cb.itemData(self._port_cb.currentIndex()) or ""
+            if self._connection_mode == "serial":
+                port = self._port_cb.itemData(self._port_cb.currentIndex()) or ""
+                baud_str = f" | {self._baud_cb.currentText()} bps"
+            else:
+                port = f"{self._host_edit.text()}:{self._tcp_port_spin.value()}"
+                baud_str = ""
             self._log(f"Connected → {port}")
-            self.statusBar().showMessage(f"STATUS: ONLINE  |  {port}  |  {self._baud_cb.currentText()} bps")
+            self.statusBar().showMessage(f"STATUS: ONLINE  |  {port}{baud_str}")
         else:
             self._conn_btn.setText("⚡  CONNECT")
             self._conn_btn.setObjectName("green"); self._conn_btn.setStyle(self._conn_btn.style())
@@ -937,53 +1204,92 @@ class MainWindow(QMainWindow):
                 cmd = parsed['cmd']
                 log_msg = None
                 if cmd == 0x01:  # Self-check response
-                    status_str = f"FPGA:{parsed['status1']:08b}, Echo:{parsed['status2']}"
+                    status1 = parsed.get('status1', 0)
+                    status2 = parsed.get('status2', 0)
+                    fpga_ok = parsed.get('fpga_system_status', False)
+                    echo_intensity = status2
+                    
+                    status_str = (
+                        f"FPGA={'OK' if fpga_ok else 'FAIL'}, "
+                        f"Echo={echo_intensity}, "
+                        f"Laser={'ON' if parsed.get('laser_light_output') else 'OFF'}, "
+                        f"5V6={'OK' if parsed.get('power_5v6_status') else 'FAIL'}"
+                    )
                     self._proto_box.append(f"[{ts}] [RX] SELF_CHECK: {status_str}")
                     log_msg = f"✓ SELF_CHECK: {status_str}"
+                    
                 elif cmd in (0x02, 0x04):  # Range response
                     dist = parsed.get('distance', 'N/A')
                     status = parsed.get('status', 'N/A')
                     self._proto_box.append(f"[{ts}] [RX] RANGE: {dist}m (status: 0x{status:02X})")
+                    
                 elif cmd == 0x06:  # Anomaly
                     self._proto_box.append(f"[{ts}] [RX] ANOMALY: status1=0x{parsed['status1']:02X}")
                     log_msg = f"⚠ ANOMALY: status=0x{parsed['status1']:02X}"
+                    
                 elif cmd == 0xA1:  # Set frequency response
                     self._proto_box.append(f"[{ts}] [RX] FREQ_SET: OK")
                     log_msg = "✓ Frequency set successfully"
-                elif cmd in (0xA2, 0xA4):  # Gate responses
+                    
+                elif cmd == 0xA2:  # Set MIN gate response
                     dist = parsed.get('gate_distance', 'N/A')
-                    gate_type = "MIN" if cmd == 0xA2 else "MAX"
-                    self._proto_box.append(f"[{ts}] [RX] GATE_{gate_type}_SET: {dist}m")
-                    log_msg = f"✓ {gate_type} gate set to {dist}m"
-                elif cmd in (0xA3, 0xA5):  # Query gate responses
+                    self._proto_box.append(f"[{ts}] [RX] GATE_MIN_SET: {dist}m")
+                    log_msg = f"✓ MIN gate set to {dist}m"
+                    
+                elif cmd == 0xA4:  # Set MAX gate response
                     dist = parsed.get('gate_distance', 'N/A')
-                    gate_type = "MIN" if cmd == 0xA3 else "MAX"
-                    self._proto_box.append(f"[{ts}] [RX] GATE_{gate_type}_QUERY: {dist}m")
-                    log_msg = f"✓ {gate_type} gate: {dist}m"
+                    self._proto_box.append(f"[{ts}] [RX] GATE_MAX_SET: {dist}m")
+                    log_msg = f"✓ MAX gate set to {dist}m"
+                    
+                elif cmd == 0xA3:  # Query MIN gate response
+                    dist = parsed.get('gate_distance', 'N/A')
+                    self._proto_box.append(f"[{ts}] [RX] GATE_MIN_QUERY: {dist}m")
+                    log_msg = f"✓ MIN gate: {dist}m"
+                    
+                elif cmd == 0xA5:  # Query MAX gate response
+                    dist = parsed.get('gate_distance', 'N/A')
+                    self._proto_box.append(f"[{ts}] [RX] GATE_MAX_QUERY: {dist}m")
+                    log_msg = f"✓ MAX gate: {dist}m"
+                    
                 elif cmd == 0xA6:  # FPGA version
                     ver = parsed.get('version', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] FPGA_VERSION: v{ver}")
-                    log_msg = f"✓ FPGA version: v{ver}"
+                    author = parsed.get('author', '')
+                    date = parsed.get('date', 0)
+                    month = parsed.get('month', 0)
+                    year = parsed.get('year', 0)
+                    self._proto_box.append(f"[{ts}] [RX] FPGA_VERSION: {ver} by {author} ({year}/{month:02d}/{date})")
+                    log_msg = f"✓ FPGA: {ver} by {author}"
+                    
                 elif cmd == 0xA7:  # MCU version
                     ver = parsed.get('version', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] MCU_VERSION: v{ver}")
-                    log_msg = f"✓ MCU version: v{ver}"
+                    author = parsed.get('author', '')
+                    date = parsed.get('date', 0)
+                    month = parsed.get('month', 0)
+                    year = parsed.get('year', 0)
+                    self._proto_box.append(f"[{ts}] [RX] MCU_VERSION: {ver} by {author} ({year}/{month:02d}/{date})")
+                    log_msg = f"✓ MCU: {ver} by {author}"
+                    
                 elif cmd == 0xA8:  # HW version
-                    mbvs = parsed.get('mbvs', 'N/A')
-                    ctvs = parsed.get('ctvs', 'N/A')
-                    apdvs = parsed.get('apdvs', 'N/A')
-                    ldvs = parsed.get('ldvs', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] HW_VERSION: MB={mbvs}, CT={ctvs}, APD={apdvs}, LD={ldvs}")
-                    log_msg = f"✓ HW: MB={mbvs}, CT={ctvs}, APD={apdvs}, LD={ldvs}"
+                    mb = parsed.get('motherboard', 'N/A')
+                    ct = parsed.get('control_board', 'N/A')
+                    apd = parsed.get('detection_board', 'N/A')
+                    ld = parsed.get('driver_board', 'N/A')
+                    self._proto_box.append(f"[{ts}] [RX] HW_VERSION: MB={mb}, CT={ct}, APD={apd}, LD={ld}")
+                    log_msg = f"✓ HW: MB={mb}, CT={ct}, APD={apd}, LD={ld}"
+                    
                 elif cmd == 0xA9:  # SN response
-                    sn = parsed.get('sn_number', 'N/A')
-                    self._proto_box.append(f"[{ts}] [RX] SN: {sn}")
+                    sn = parsed.get('serial_number', 'N/A')
+                    month = parsed.get('month', 0)
+                    year = parsed.get('year', 0)
+                    self._proto_box.append(f"[{ts}] [RX] SN: {sn} (MFG: {year}/{month:02d})")
                     log_msg = f"✓ Serial Number: {sn}"
+                    
                 elif cmd in (0x90, 0x91):  # Light count responses
                     count = parsed.get('light_count', 'N/A')
                     count_type = "TOTAL" if cmd == 0x90 else "POWER_ON"
                     self._proto_box.append(f"[{ts}] [RX] LIGHT_COUNT_{count_type}: {count}")
                     log_msg = f"✓ {count_type} light count: {count}"
+                    
                 else:
                     self._proto_box.append(f"[{ts}] [RX] UNPARSED: {rx.hex(' ').upper()}")
                 
