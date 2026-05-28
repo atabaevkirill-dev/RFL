@@ -10,6 +10,7 @@ import struct
 import threading
 from datetime import datetime
 from collections import deque
+import urllib.request
 
 import serial
 import serial.tools.list_ports
@@ -22,7 +23,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, QPointF, pyqtSignal, QObject
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont,
-    QLinearGradient, QConicalGradient, QPainterPath
+    QLinearGradient, QConicalGradient, QPainterPath, QPixmap, QImage
 )
 
 # ── Colours ──────────────────────────────────────────────────────────────────
@@ -858,7 +859,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 820)
         self.setStyleSheet(STYLE)
 
-        self._worker = CommWorker()
+        self._worker = SerialWorker()
         self._worker.distance_received.connect(self._on_distance)
         self._worker.raw_frame.connect(self._on_raw_frame)
         self._worker.error.connect(self._on_error)
